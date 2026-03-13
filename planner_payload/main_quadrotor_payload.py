@@ -30,6 +30,7 @@ class PayloadControlMujocoNode(Node):
         self.t_N = 1.0
         self.N = np.arange(0, self.t_N + self.ts, self.ts)
         self.N_prediction = self.N.shape[0]
+        print(self.N_prediction)
 
         # Internal parameters defintion
         self.robot_num = 1
@@ -47,11 +48,11 @@ class PayloadControlMujocoNode(Node):
         kp_min = (c1*(kv_min*kv_min) + 2*kv_min*c1 - c1*c1)/((self.mass)*(4*(kv_min - c1)-1))
         kp_min = 80
         self.kp_min = kp_min
-        self.kv_min = 50
+        self.kv_min = 100
         self.c1 = c1
         
         # Cable length
-        self.length = 0.83
+        self.length = 0.88
         self.e3 = ca.DM([0, 0, 1])
 
         # Position of the system payload
@@ -113,7 +114,7 @@ class PayloadControlMujocoNode(Node):
 
         self.publisher_prediction_drone_0 = self.create_publisher(Path, "/quadrotor/predicted_path", 10)
 
-        self.publisher_prediction_payload = self.create_publisher(Path, "/quadrotor/predicted_path", 10)
+        self.publisher_prediction_payload = self.create_publisher(Path, "/quadrotor/payload/predicted_path", 10)
 
         # TF
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -142,7 +143,7 @@ class PayloadControlMujocoNode(Node):
         self.xd = np.zeros((self.n_x, ), dtype=np.double)
         self.ud = np.zeros((self.n_u, ), dtype=np.double)
 
-        self.xd[0] = 1.0
+        self.xd[0] = 3.0
         self.xd[1] = 0.0
         self.xd[2] = 2.0
 
@@ -284,7 +285,7 @@ class PayloadControlMujocoNode(Node):
         # Linear Dynamics
         linear_velocity = v_p
         cross_angular_payload = ca.cross(r1, n1)
-        linear_acceleration = -(1/(self.mass))*t_1_cmd*n1 - self.gravity*self.e3 - ((self.mass_quad*self.length)/(self.mass + self.mass_quad))*(cross_angular_payload.T@cross_angular_payload)*n1 
+        linear_acceleration = -(1/(self.mass))*t_1_cmd*n1 - self.gravity*self.e3
 
         # Angular dynamics
         # Cable Kinematics
@@ -360,10 +361,11 @@ class PayloadControlMujocoNode(Node):
         error_n1 = ca.cross(n1_d, n1)
         # Cost Function control actions
         tension_error = t_d - t_cmd
-        r_error = r1_d - r1
+        r_error = r1_d - r_dot_d
+        orthogonality_error = ca.dot(n1, r1)
 
-        ocp.model.cost_expr_ext_cost = lyapunov_position   + error_n1.T@error_n1 + 1*(r_error.T@r_error) + 1*(tension_error*tension_error) + 10*(r_dot_cmd.T@r_dot_cmd)
-        ocp.model.cost_expr_ext_cost_e = lyapunov_position + error_n1.T@error_n1 + 1*(r_error.T@r_error) 
+        ocp.model.cost_expr_ext_cost = lyapunov_position   + error_n1.T@error_n1 + 1*(r_error.T@r_error) + 5*(tension_error*tension_error) + 20*(r_dot_cmd.T@r_dot_cmd) + 10 * orthogonality_error**2
+        ocp.model.cost_expr_ext_cost_e = lyapunov_position + error_n1.T@error_n1 + 1*(r_error.T@r_error) + 10 * orthogonality_error**2
 
         ref_params = np.hstack((self.x_0, self.u_equilibrium))
 
@@ -449,7 +451,6 @@ class PayloadControlMujocoNode(Node):
         r_dot = u[1:]
 
         # Linear Acceleration Payload
-        cross_angular_payload = ca.cross(r_p, n_p)
         linear_acceleration = -(1/(self.mass))*t_1_cmd*n_p - self.gravity*self.e3
 
         term_acceleration = linear_acceleration
@@ -560,7 +561,7 @@ class PayloadControlMujocoNode(Node):
         # Fill poses for each drone
         for k in range(self.N_prediction):
             x_k = self.acados_ocp_solver.get(k, "x")
-            xq = np.array(self.quadrotor_position(x_k)).reshape((self.robot_num * 3,))
+            xq = np.array(self.quadrotor_position(x_k)).reshape((3,))
 
             # Quadrotor positions
             for i in range(self.robot_num):
@@ -595,7 +596,7 @@ class PayloadControlMujocoNode(Node):
             # Init Optimization Problem
             for k in range(5000):
                 arr_str = np.array2string(self.x_0, precision=3, separator=", ", suppress_small=True)
-                self.get_logger().info(f"state[] = {arr_str}")
+                #self.get_logger().info(f"state[] = {arr_str}")
 
             print(self.x_0.shape)
             self.ocp = self.solver(self.x_0)
@@ -611,43 +612,6 @@ class PayloadControlMujocoNode(Node):
                 self.acados_ocp_solver.set(stage, "u", self.ud)
         return None
         
-    def run(self):
-        # Build Optimization Problem just once
-        self.prepare()
-
-        self.acados_ocp_solver.set(0, "lbx", self.x_0)
-        self.acados_ocp_solver.set(0, "ubx", self.x_0)
-
-        # Desired Trajectory of the system
-        for j in range(self.N_prediction):
-            yref = self.xd
-            uref = self.ud
-            aux_ref = np.hstack((yref, uref))
-            self.acados_ocp_solver.set(j, "p", aux_ref)
-        # Desired Trayectory at the last Horizon
-        yref_N = self.xd
-        uref_N = self.ud
-        aux_ref_N = np.hstack((yref_N, uref_N))
-        self.acados_ocp_solver.set(self.N_prediction, "p", aux_ref_N)
-        # Check Solution since there can be possible errors 
-        self.acados_ocp_solver.solve()
-
-        # get Control Actions and predictions
-        u = self.acados_ocp_solver.get(0, "u")
-        x_k = self.acados_ocp_solver.get(1, "x")
-
-        ## Send Desired States Quadrotor
-        self.publish_prediction()
-
-        xQ = np.array(self.quadrotor_position(x_k)).reshape((self.robot_num*3, ))
-        xQ_dot = np.array(self.quadrotor_velocity(x_k)).reshape((self.robot_num*3, ))
-        xQ_dot_dot = np.array(self.quadrotor_acceleration(x_k, u)).reshape((self.robot_num*3, ))
-
-        xd_q0, vd_q0, ad_q0 = self.geometric_control(xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
-
-        self.send_position_cmd(self.publisher_ref_drone_0, xd_q0, vd_q0, ad_q0)
-        self.publish_transforms()
-
     def validation(self):
         # Build Optimization Problem just once
         self.prepare()
@@ -668,13 +632,30 @@ class PayloadControlMujocoNode(Node):
         # Check Solution since there can be possible errors 
         self.acados_ocp_solver.solve()
 
+        status = self.acados_ocp_solver.solve()
+        if status != 0:
+            self.get_logger().error(f"acados returned status {status}")
+            return
+
         # get Control Actions and predictions
         u = self.acados_ocp_solver.get(0, "u")
         x_k = self.acados_ocp_solver.get(1, "x")
+
+        self.publish_prediction()
+
+        xQ = np.array(self.quadrotor_position(x_k)).reshape((self.robot_num*3, ))
+        xQ_dot = np.array(self.quadrotor_velocity(x_k)).reshape((self.robot_num*3, ))
+        xQ_dot_dot = np.array(self.quadrotor_acceleration(x_k, u)).reshape((self.robot_num*3, ))
+
+        xd_q0, vd_q0, ad_q0 = self.geometric_control(xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
+
+        self.send_position_cmd(self.publisher_ref_drone_0, xd_q0, vd_q0, ad_q0)
+
         self.get_logger().info("Solving the MPC problem")
 
         # Build Optimization Problem just once
         self.publish_transforms()
+
 
 
 def main(arg = None):
