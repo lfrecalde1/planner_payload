@@ -21,12 +21,29 @@ class PayloadControlMujocoNode(Node):
     def __init__(self):
         super().__init__('SinglePayloadPlanner')
 
+        # Runtime parameters (mirrors dq_nmpc style parameterization).
+        self.declare_parameter('planner.ts', 0.05)
+        self.declare_parameter('planner.horizon_time', 1.0)
+        self.declare_parameter('planner.trajectory_speed_scale', 1.0)
+        self.declare_parameter('planner.transition_hold_time', 2.0)
+        self.declare_parameter('planner.transition_blend_time', 3.5)
+        self.declare_parameter('planner.acceleration_phase_time', 3.5)
+        self.declare_parameter('planner.cruise_speed_factor', 1.8)
+        self.declare_parameter('planner.height_offset', 0.8)
+        self.declare_parameter('nmpc.weight_cable_direction', 0.1)
+        self.declare_parameter('nmpc.weight_tension', 5.0)
+        self.declare_parameter('nmpc.weight_rdot', 5.0)
+        self.declare_parameter('nmpc.weight_orthogonality', 10.0)
+        self.declare_parameter('nmpc.norm_constraint_slack_weight', 100.0)
+        self.declare_parameter('nmpc.unit_vector_norm_tol', 1e-3)
+        self.declare_parameter('nmpc.regularize_method', 'CONVEXIFY')
+
         # Time Definition
-        self.ts = 0.05
+        self.ts = float(self.get_parameter('planner.ts').value)
         self.final = 15
 
         # Prediction Node of the NMPC formulation
-        self.t_N = 1.0
+        self.t_N = float(self.get_parameter('planner.horizon_time').value)
         self.N = np.arange(0, self.t_N + self.ts, self.ts)
         self.N_prediction = self.N.shape[0]
 
@@ -84,7 +101,7 @@ class PayloadControlMujocoNode(Node):
 
         # Maximum and minimun control actions
         self.tension_min = 0.8*self.tensions_init
-        self.tension_max = 6.5*self.tensions_init
+        self.tension_max = 8.0*self.tensions_init
 
         self.r_dot_max = np.array([6.0, 6.0, 6.0]*self.robot_num, dtype=np.double)
         self.r_dot_min = -self.r_dot_max
@@ -98,17 +115,17 @@ class PayloadControlMujocoNode(Node):
 
         # Define odometry subscriber
         self.subscriber_payload_ = self.create_subscription(Odometry, "/quadrotor/payload/odom", self.callback_get_odometry_payload, 10)
-        self.subscriber_drone_0_ = self.create_subscription(Odometry, "/quadrotor/odom", self.callback_get_odometry_drone_0, 10)
+        self.publisher_desired_payload = self.create_publisher(Path, "/quadrotor/payload/desired_path", 10)
+
 
         # Define PositionCmd publisher for each droe
         self.publisher_ref_drone_0 = self.create_publisher(PositionCommand, "/quadrotor/position_cmd", 10)
-
         self.publisher_prediction_drone_0 = self.create_publisher(Path, "/quadrotor/predicted_path", 10)
-
         self.publisher_prediction_payload = self.create_publisher(Path, "/quadrotor/payload/predicted_path", 10)
-
-        self.publisher_desired_payload = self.create_publisher(Path, "/quadrotor/payload/desired_path", 10)
         self.publisher_desired_quadrotor = self.create_publisher(Path, "/quadrotor/desired_path", 10)
+        
+        # Subcriber of each drone
+        self.subscriber_drone_0_ = self.create_subscription(Odometry, "/quadrotor/odom", self.callback_get_odometry_drone_0, 10)
 
         # TF
         self.tf_broadcaster = TransformBroadcaster(self)
@@ -166,21 +183,29 @@ class PayloadControlMujocoNode(Node):
 
         self.timer = self.create_timer(self.ts, self.run)
         self.start_time = None
-        self.trajectory_speed_scale = 1.9
-        self.transition_hold_time = 1.0
-        self.transition_blend_time = 1.5
+        self.trajectory_start_time = None
+        self.trajectory_speed_scale = float(self.get_parameter('planner.trajectory_speed_scale').value)
+        self.transition_hold_time = float(self.get_parameter('planner.transition_hold_time').value)
+        self.transition_blend_time = float(self.get_parameter('planner.transition_blend_time').value)
+        self.acceleration_phase_time = float(self.get_parameter('planner.acceleration_phase_time').value)
+        self.cruise_speed_factor = float(self.get_parameter('planner.cruise_speed_factor').value)
+        self.height_offset = float(self.get_parameter('planner.height_offset').value)
+        self.weight_cable_direction = float(self.get_parameter('nmpc.weight_cable_direction').value)
+        self.weight_tension = float(self.get_parameter('nmpc.weight_tension').value)
+        self.weight_rdot = float(self.get_parameter('nmpc.weight_rdot').value)
+        self.weight_orthogonality = float(self.get_parameter('nmpc.weight_orthogonality').value)
+        self.norm_constraint_slack_weight = float(self.get_parameter('nmpc.norm_constraint_slack_weight').value)
+        self.unit_vector_norm_tol = float(self.get_parameter('nmpc.unit_vector_norm_tol').value)
+        self.regularize_method = str(self.get_parameter('nmpc.regularize_method').value)
 
     def _base_lissajous(self, t: float):
-        xc, yc, zc = self.payload_ref_start[0], self.payload_ref_start[1], self.payload_ref_start[2]
+        xc, yc, zc = self.payload_ref_start[0], self.payload_ref_start[1], self.payload_ref_start[2] + self.height_offset
 
         # Amplitudes
-        Ax, Ay, Az = 1.2, 0.8, 0.0
+        Ax, Ay, Az = 5.0, 1.0, 0.0
 
         # Different frequencies -> true Lissajous
         wx, wy, wz = 0.8, 1.4, 0.6
-        wx *= self.trajectory_speed_scale
-        wy *= self.trajectory_speed_scale
-        wz *= self.trajectory_speed_scale
 
         # Phases
         phix, phiy, phiz = 0.0, np.pi / 3.0, np.pi / 6.0
@@ -203,38 +228,66 @@ class PayloadControlMujocoNode(Node):
             -Az * wz * wz * np.sin(wz * t + phiz)
         ], dtype=np.double)
 
-        return xd, vd, ad
+        jd = np.array([
+            -Ax * wx * wx * wx * np.cos(wx * t + phix),
+            -Ay * wy * wy * wy * np.cos(wy * t + phiy),
+            -Az * wz * wz * wz * np.cos(wz * t + phiz)
+        ], dtype=np.double)
 
-    def _min_snap_blend(self, s: float):
-        # 7th-order smoothstep: p, v, a, jerk are zero at both ends.
-        a = 35.0 * s**4 - 84.0 * s**5 + 70.0 * s**6 - 20.0 * s**7
-        a_s = 140.0 * s**3 - 420.0 * s**4 + 420.0 * s**5 - 140.0 * s**6
-        a_ss = 420.0 * s**2 - 1680.0 * s**3 + 2100.0 * s**4 - 840.0 * s**5
-        return a, a_s, a_ss
+        sd = np.array([
+            Ax * wx * wx * wx * wx * np.sin(wx * t + phix),
+            Ay * wy * wy * wy * wy * np.sin(wy * t + phiy),
+            Az * wz * wz * wz * wz * np.sin(wz * t + phiz)
+        ], dtype=np.double)
+
+        return xd, vd, ad, jd, sd
+
+    def _phase_time_scaling(self, t_move: float):
+        # Explicit acceleration phase: tau_dot ramps from 0 -> v_cruise with C2 continuity.
+        T = max(self.acceleration_phase_time, 1e-3)
+        v_cruise = max(self.cruise_speed_factor * self.trajectory_speed_scale, 1e-3)
+        if t_move >= T:
+            tau = v_cruise * (t_move - 0.5 * T)
+            return tau, v_cruise, 0.0, 0.0, 0.0
+
+        s = np.clip(t_move / T, 0.0, 1.0)
+        s2 = s * s
+        s3 = s2 * s
+        s4 = s3 * s
+        s5 = s4 * s
+        s6 = s5 * s
+
+        # tau_dot(s) = 6 s^5 - 15 s^4 + 10 s^3
+        tau_dot = v_cruise * (6.0 * s5 - 15.0 * s4 + 10.0 * s3)
+        # Integral of tau_dot over t in [0, t_move]
+        tau = T * v_cruise * (s6 - 3.0 * s5 + 2.5 * s4)
+        tau_ddot = v_cruise * (30.0 * s4 - 60.0 * s3 + 30.0 * s2) / T
+        tau_3dot = v_cruise * (120.0 * s3 - 180.0 * s2 + 60.0 * s) / (T * T)
+        tau_4dot = v_cruise * (360.0 * s2 - 360.0 * s + 60.0) / (T * T * T)
+        return tau, tau_dot, tau_ddot, tau_3dot, tau_4dot
 
     def desired_lissajous(self, t: float):
         if t <= self.transition_hold_time:
-            return self.payload_ref_start.copy(), np.zeros(3, dtype=np.double), np.zeros(3, dtype=np.double)
+            z = np.zeros(3, dtype=np.double)
+            return self.payload_ref_start.copy(), z, z, z, z
 
-        t_blend = t - self.transition_hold_time
-        if t_blend >= self.transition_blend_time:
-            t_nominal = t_blend - self.transition_blend_time
-            return self._base_lissajous(t_nominal)
+        t_move = t - self.transition_hold_time
+        tau, tau_dot, tau_ddot, tau_3dot, tau_4dot = self._phase_time_scaling(t_move)
+        pd_nom, vd_nom, ad_nom, jd_nom, sd_nom = self._base_lissajous(tau)
 
-        s = np.clip(t_blend / self.transition_blend_time, 0.0, 1.0)
-        alpha, alpha_s, alpha_ss = self._min_snap_blend(s)
-        alpha_dot = alpha_s / self.transition_blend_time
-        alpha_ddot = alpha_ss / (self.transition_blend_time * self.transition_blend_time)
-
-        # Blend from hover-at-start into nominal trajectory while preserving C2 continuity.
-        pd_nom, vd_nom, ad_nom = self._base_lissajous(t_blend)
-        p0 = self.payload_ref_start
-        delta = pd_nom - p0
-
-        pd = p0 + alpha * delta
-        vd = alpha_dot * delta + alpha * vd_nom
-        ad = alpha_ddot * delta + 2.0 * alpha_dot * vd_nom + alpha * ad_nom
-        return pd, vd, ad
+        # Chain rule from nominal time tau to real time t.
+        pd = pd_nom
+        vd = vd_nom * tau_dot
+        ad = ad_nom * (tau_dot * tau_dot) + vd_nom * tau_ddot
+        jd = jd_nom * (tau_dot ** 3) + 3.0 * ad_nom * tau_dot * tau_ddot + vd_nom * tau_3dot
+        sd = (
+            sd_nom * (tau_dot ** 4)
+            + 6.0 * jd_nom * (tau_dot ** 2) * tau_ddot
+            + 3.0 * ad_nom * (tau_ddot ** 2)
+            + 4.0 * ad_nom * tau_dot * tau_3dot
+            + vd_nom * tau_4dot
+        )
+        return pd, vd, ad, jd, sd
     def publish_desired_path(self):
         now = self.get_clock().now().to_msg()
 
@@ -248,10 +301,11 @@ class PayloadControlMujocoNode(Node):
 
         # Use the same reference cable direction you use in MPC
         n_ref = np.array([0.0, 0.0, -1.0], dtype=np.double)
+        t0 = self.trajectory_start_time if self.trajectory_start_time is not None else time.time()
 
         for k in range(self.N_prediction + 1):
-            tk = (time.time() - self.start_time) + k * self.ts
-            pd, vd, ad = self.desired_lissajous(tk)
+            tk = (time.time() - t0) + k * self.ts
+            pd, vd, ad, _, _ = self.desired_lissajous(tk)
 
             # Desired payload pose
             pose_payload = PoseStamped()
@@ -351,7 +405,6 @@ class PayloadControlMujocoNode(Node):
         if not (self.payload_odom_received and self.quad_odom_received):
             return
         self.payload_ref_start = self.x_0[0:3].copy()
-        self.start_time = time.time()
         self.reference_initialized = True
         arr_str = np.array2string(self.payload_ref_start, precision=3, separator=", ", suppress_small=True)
         self.get_logger().info(f"Initialized desired path at measured payload position {arr_str}")
@@ -473,7 +526,7 @@ class PayloadControlMujocoNode(Node):
         error_velocity_quad = v_p - v_p_d
 
         # Cost functions
-        lyapunov_position = 10*(1/2)*self.kp_min*error_position_quad.T@error_position_quad + self.kv_min*(1/2)*(self.mass)*error_velocity_quad.T@error_velocity_quad
+        lyapunov_position = 50*(1/2)*self.kp_min*error_position_quad.T@error_position_quad + self.kv_min*(1/2)*(self.mass)*error_velocity_quad.T@error_velocity_quad
 
         # Error cable direction
         error_n1 = ca.cross(n1_d, n1)
@@ -486,8 +539,18 @@ class PayloadControlMujocoNode(Node):
         # Enforce the velocity is orthogonal
         orthogonality_error = ca.dot(n1, r1)
 
-        ocp.model.cost_expr_ext_cost = lyapunov_position   + 0.1*error_n1.T@error_n1 + 5*(tension_error*tension_error) + 5*(r_dot_error.T@r_dot_error) + 10 * (orthogonality_error**2)
-        ocp.model.cost_expr_ext_cost_e = lyapunov_position + 0.1*error_n1.T@error_n1 + 10 * (orthogonality_error**2)
+        ocp.model.cost_expr_ext_cost = (
+            lyapunov_position
+            + self.weight_cable_direction * (error_n1.T @ error_n1)
+            + self.weight_tension * (tension_error * tension_error)
+            + self.weight_rdot * (r_dot_error.T @ r_dot_error)
+            + self.weight_orthogonality * (orthogonality_error**2)
+        )
+        ocp.model.cost_expr_ext_cost_e = (
+            lyapunov_position
+            + self.weight_cable_direction * (error_n1.T @ error_n1)
+            + self.weight_orthogonality * (orthogonality_error**2)
+        )
 
         ref_params = np.hstack((self.x_0, self.u_equilibrium))
 
@@ -501,9 +564,26 @@ class PayloadControlMujocoNode(Node):
         ocp.constraints.idxbu = np.array([0, 1, 2, 3])
         ocp.constraints.x0 = x0
 
+        # Softly enforce ||n1|| ~= 1 to improve robustness against numerical drift.
+        ocp.model.con_h_expr = ca.vertcat(ca.dot(n1, n1))
+        nh = 1
+        nsbx = 0
+        nsh = nh
+        ns = nsh + nsbx
+        ocp.cost.zl = self.norm_constraint_slack_weight * np.ones((ns, ))
+        ocp.cost.Zl = self.norm_constraint_slack_weight * np.ones((ns, ))
+        ocp.cost.zu = self.norm_constraint_slack_weight * np.ones((ns, ))
+        ocp.cost.Zu = self.norm_constraint_slack_weight * np.ones((ns, ))
+        ocp.constraints.lh = np.array([1.0 - self.unit_vector_norm_tol])
+        ocp.constraints.uh = np.array([1.0 + self.unit_vector_norm_tol])
+        ocp.constraints.lsh = np.zeros((nsh, ))
+        ocp.constraints.ush = np.zeros((nsh, ))
+        ocp.constraints.idxsh = np.array(range(nsh), dtype=np.int32)
+
         ocp.solver_options.qp_solver = "FULL_CONDENSING_HPIPM" 
         ocp.solver_options.qp_solver_cond_N = self.N_prediction // 4
         ocp.solver_options.hessian_approx = "EXACT"  
+        ocp.solver_options.regularize_method = self.regularize_method
         ocp.solver_options.integrator_type = "ERK"
         ocp.solver_options.nlp_solver_type = "SQP_RTI"
         ocp.solver_options.Tsim = self.ts
@@ -522,7 +602,7 @@ class PayloadControlMujocoNode(Node):
 
         # Vectorized expression:
         term = x_p - xq
-        n_k      = (term/ca.norm_2(term))
+        n_k      = term / ca.fmax(ca.norm_2(term), 1e-6)
         quadrotor_payload_vector_f = ca.Function('quadrotor_payload_vector_f', [x, xq], [n_k])
         return quadrotor_payload_vector_f
 
@@ -600,8 +680,8 @@ class PayloadControlMujocoNode(Node):
         v_Q = xQ[3:6]
 
         a = x_p - x_Q
-        norm_a = ca.norm_2(a)
-        dot_a = a.T@a
+        norm_a = ca.fmax(ca.norm_2(a), 1e-6)
+        dot_a = ca.fmax(a.T@a, 1e-12)
         I = ca.MX.eye(3)
         a_dot = v_p - v_Q
 
@@ -610,7 +690,7 @@ class PayloadControlMujocoNode(Node):
         r_velocity_f = ca.Function('r_velocity_f', [x, xQ], [r_k])
         return r_velocity_f
 
-    def send_position_cmd(self, publisher, x, v, a):
+    def send_position_cmd(self, publisher, x, v, a, tension, direction):
         position_cmd_msg = PositionCommand()
         position_cmd_msg.position.x = x[0]
         position_cmd_msg.position.y = x[1]
@@ -623,6 +703,14 @@ class PayloadControlMujocoNode(Node):
         position_cmd_msg.acceleration.x = a[0]
         position_cmd_msg.acceleration.y = a[1]
         position_cmd_msg.acceleration.z = a[2]
+
+        cable_force = tension*direction
+
+        position_cmd_msg.cable_force.x = cable_force[0]
+        position_cmd_msg.cable_force.y = cable_force[1]
+        position_cmd_msg.cable_force.z = cable_force[2]
+
+
         publisher.publish(position_cmd_msg)
         return None 
 
@@ -717,12 +805,6 @@ class PayloadControlMujocoNode(Node):
         # Publish drone and payload desired path
         self.publisher_prediction_drone_0.publish(path_msgs[0])
         self.publisher_prediction_payload.publish(payload_msgs[0])
-
-    def geometric_control(self, xd, vd, ad, t, n):
-        # Control Error
-        aux_variable = ad 
-        ad = (aux_variable - t*n)
-        return xd, vd, ad
     
     def prepare(self):
         if self.flag == 0:
@@ -740,6 +822,9 @@ class PayloadControlMujocoNode(Node):
                 self.acados_ocp_solver.set(stage, "x", self.x_0)
             for stage in range(self.N_prediction):
                 self.acados_ocp_solver.set(stage, "u", self.ud)
+            # Start trajectory clock only when the solver is ready.
+            self.trajectory_start_time = time.time()
+            self.start_time = self.trajectory_start_time
         return None
 
     def run(self):
@@ -752,12 +837,12 @@ class PayloadControlMujocoNode(Node):
         self.acados_ocp_solver.set(0, "lbx", self.x_0)
         self.acados_ocp_solver.set(0, "ubx", self.x_0)
 
-        t_now = time.time() - self.start_time
-        print("---------------------------------------------------")
+        if self.trajectory_start_time is None:
+            return
+        t_now = time.time() - self.trajectory_start_time
         for j in range(self.N_prediction):
             tj = t_now + j * self.ts
-            pd, vd, ad = self.desired_lissajous(tj)
-            print(pd)
+            pd, vd, ad, _, _ = self.desired_lissajous(tj)
 
             yref = np.zeros((self.n_x,), dtype=np.double)
             yref[0:3] = pd
@@ -768,13 +853,14 @@ class PayloadControlMujocoNode(Node):
             yref[9:12] = np.zeros(3, dtype=np.double)
 
             uref = np.zeros((self.n_u,), dtype=np.double)
-            uref[0] = self.tensions_init
+            tension_ff = -self.mass * np.dot(ad + np.array([0.0, 0.0, self.gravity]), np.array([0.0, 0.0, -1.0]))
+            uref[0] = float(np.clip(tension_ff, self.tension_min, self.tension_max))
             uref[1:4] = 0.0
 
             aux_ref = np.hstack((yref, uref))
             self.acados_ocp_solver.set(j, "p", aux_ref)
 
-        pdN, vdN, adN = self.desired_lissajous(t_now + self.N_prediction * self.ts)
+        pdN, vdN, adN, _, _ = self.desired_lissajous(t_now + self.N_prediction * self.ts)
         yref_N = np.zeros((self.n_x,), dtype=np.double)
         yref_N[0:3] = pdN
         yref_N[3:6] = vdN
@@ -782,7 +868,8 @@ class PayloadControlMujocoNode(Node):
         yref_N[9:12] = np.zeros(3, dtype=np.double)
 
         uref_N = np.zeros((self.n_u,), dtype=np.double)
-        uref_N[0] = self.tensions_init
+        tension_ff_N = -self.mass * np.dot(adN + np.array([0.0, 0.0, self.gravity]), np.array([0.0, 0.0, -1.0]))
+        uref_N[0] = float(np.clip(tension_ff_N, self.tension_min, self.tension_max))
         aux_ref_N = np.hstack((yref_N, uref_N))
         self.acados_ocp_solver.set(self.N_prediction, "p", aux_ref_N)
 
@@ -802,12 +889,10 @@ class PayloadControlMujocoNode(Node):
         xQ_dot = np.array(self.quadrotor_velocity(x_k)).reshape((3,))
         xQ_dot_dot = np.array(self.quadrotor_acceleration(x_k, u)).reshape((3,))
 
-        xd_q0, vd_q0, ad_q0 = self.geometric_control(
-            xQ, xQ_dot, xQ_dot_dot, u[0], x_k[6:9]
-        )
-
-        self.send_position_cmd(self.publisher_ref_drone_0, xd_q0, vd_q0, ad_q0)
-        self.publish_transforms() 
+        self.send_position_cmd(self.publisher_ref_drone_0, xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
+        self.get_logger().info("Solving the MPC problem")
+        # Build Optimization Problem just once
+        self.publish_transforms()
 
     def validation(self):
         # Build Optimization Problem just once
@@ -844,10 +929,7 @@ class PayloadControlMujocoNode(Node):
         xQ_dot = np.array(self.quadrotor_velocity(x_k)).reshape((self.robot_num*3, ))
         xQ_dot_dot = np.array(self.quadrotor_acceleration(x_k, u)).reshape((self.robot_num*3, ))
 
-        xd_q0, vd_q0, ad_q0 = self.geometric_control(xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
-
-        self.send_position_cmd(self.publisher_ref_drone_0, xd_q0, vd_q0, ad_q0)
-
+        self.send_position_cmd(self.publisher_ref_drone_0, xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
         self.get_logger().info("Solving the MPC problem")
 
         # Build Optimization Problem just once
@@ -862,8 +944,6 @@ def main(arg = None):
         rclpy.spin(payload_node)  # Will run until manually interrupted
     except KeyboardInterrupt:
         payload_node.get_logger().info('Simulation stopped manually.')
-        payload_node.destroy_node()
-        rclpy.shutdown()
     finally:
         payload_node.destroy_node()
         rclpy.shutdown()

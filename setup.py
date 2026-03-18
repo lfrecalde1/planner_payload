@@ -25,6 +25,8 @@ setup(
     entry_points={
         'console_scripts': [
             'singlepayloadplanner = planner_payload.main_quadrotor_payload:main',
+            'doublepayloadplanner = planner_payload.main_two_quadrotor_payload:main',
+            'quadrotorpolicy = planner_payload.main_quadrotor:main',
         ],
     },
 )
