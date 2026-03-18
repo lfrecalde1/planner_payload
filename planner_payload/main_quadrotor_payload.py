@@ -28,8 +28,10 @@ class PayloadControlMujocoNode(Node):
         self.declare_parameter('planner.transition_hold_time', 2.0)
         self.declare_parameter('planner.transition_blend_time', 3.5)
         self.declare_parameter('planner.acceleration_phase_time', 3.5)
-        self.declare_parameter('planner.cruise_speed_factor', 1.8)
+        self.declare_parameter('planner.cruise_speed_factor', 1.5)
         self.declare_parameter('planner.height_offset', 0.8)
+        self.declare_parameter('planner.reference_mode', 'trajectory')
+        self.declare_parameter('planner.regulation_offset', [1.0, 1.0, 0.5])
         self.declare_parameter('nmpc.weight_cable_direction', 0.1)
         self.declare_parameter('nmpc.weight_tension', 5.0)
         self.declare_parameter('nmpc.weight_rdot', 5.0)
@@ -67,7 +69,7 @@ class PayloadControlMujocoNode(Node):
         self.c1 = c1
         
         # Cable length
-        self.length = 0.83
+        self.length = 0.88
         self.e3 = ca.DM([0, 0, 1])
 
         # Position of the system payload
@@ -190,6 +192,8 @@ class PayloadControlMujocoNode(Node):
         self.acceleration_phase_time = float(self.get_parameter('planner.acceleration_phase_time').value)
         self.cruise_speed_factor = float(self.get_parameter('planner.cruise_speed_factor').value)
         self.height_offset = float(self.get_parameter('planner.height_offset').value)
+        self.reference_mode = str(self.get_parameter('planner.reference_mode').value).strip().lower()
+        self.regulation_offset = np.array(self.get_parameter('planner.regulation_offset').value, dtype=np.double).reshape((3,))
         self.weight_cable_direction = float(self.get_parameter('nmpc.weight_cable_direction').value)
         self.weight_tension = float(self.get_parameter('nmpc.weight_tension').value)
         self.weight_rdot = float(self.get_parameter('nmpc.weight_rdot').value)
@@ -288,6 +292,49 @@ class PayloadControlMujocoNode(Node):
             + vd_nom * tau_4dot
         )
         return pd, vd, ad, jd, sd
+
+    def _smoothstep_c4(self, s: float):
+        # 9th-order smoothstep with zero derivatives up to 4th order at both ends.
+        a = 126.0 * s**5 - 420.0 * s**6 + 540.0 * s**7 - 315.0 * s**8 + 70.0 * s**9
+        a_s = 630.0 * s**4 - 2520.0 * s**5 + 3780.0 * s**6 - 2520.0 * s**7 + 630.0 * s**8
+        a_ss = 2520.0 * s**3 - 12600.0 * s**4 + 22680.0 * s**5 - 17640.0 * s**6 + 5040.0 * s**7
+        a_sss = 7560.0 * s**2 - 50400.0 * s**3 + 113400.0 * s**4 - 105840.0 * s**5 + 35280.0 * s**6
+        a_ssss = 15120.0 * s - 151200.0 * s**2 + 453600.0 * s**3 - 529200.0 * s**4 + 211680.0 * s**5
+        return a, a_s, a_ss, a_sss, a_ssss
+
+    def desired_regulation(self, t: float):
+        p0 = self.payload_ref_start
+        pf = self.payload_ref_start + self.regulation_offset
+        delta = pf - p0
+
+        if t <= self.transition_hold_time:
+            z = np.zeros(3, dtype=np.double)
+            return p0.copy(), z, z, z, z
+
+        T = max(self.transition_blend_time, 1e-3)
+        t_move = t - self.transition_hold_time
+        if t_move >= T:
+            z = np.zeros(3, dtype=np.double)
+            return pf.copy(), z, z, z, z
+
+        s = np.clip(t_move / T, 0.0, 1.0)
+        a, a_s, a_ss, a_sss, a_ssss = self._smoothstep_c4(s)
+        a_dot = a_s / T
+        a_ddot = a_ss / (T * T)
+        a_3dot = a_sss / (T ** 3)
+        a_4dot = a_ssss / (T ** 4)
+
+        pd = p0 + a * delta
+        vd = a_dot * delta
+        ad = a_ddot * delta
+        jd = a_3dot * delta
+        sd = a_4dot * delta
+        return pd, vd, ad, jd, sd
+
+    def desired_reference(self, t: float):
+        if self.reference_mode == 'regulation':
+            return self.desired_regulation(t)
+        return self.desired_lissajous(t)
     def publish_desired_path(self):
         now = self.get_clock().now().to_msg()
 
@@ -305,7 +352,7 @@ class PayloadControlMujocoNode(Node):
 
         for k in range(self.N_prediction + 1):
             tk = (time.time() - t0) + k * self.ts
-            pd, vd, ad, _, _ = self.desired_lissajous(tk)
+            pd, vd, ad, _, _ = self.desired_reference(tk)
 
             # Desired payload pose
             pose_payload = PoseStamped()
@@ -408,6 +455,10 @@ class PayloadControlMujocoNode(Node):
         self.reference_initialized = True
         arr_str = np.array2string(self.payload_ref_start, precision=3, separator=", ", suppress_small=True)
         self.get_logger().info(f"Initialized desired path at measured payload position {arr_str}")
+        if self.reference_mode == 'regulation':
+            target = self.payload_ref_start + self.regulation_offset
+            target_str = np.array2string(target, precision=3, separator=", ", suppress_small=True)
+            self.get_logger().info(f"Regulation target (initial + offset): {target_str}")
 
     def payloadModel(self)->AcadosModel:
         # Model Name
@@ -526,7 +577,7 @@ class PayloadControlMujocoNode(Node):
         error_velocity_quad = v_p - v_p_d
 
         # Cost functions
-        lyapunov_position = 50*(1/2)*self.kp_min*error_position_quad.T@error_position_quad + self.kv_min*(1/2)*(self.mass)*error_velocity_quad.T@error_velocity_quad
+        lyapunov_position = 100*(1/2)*self.kp_min*error_position_quad.T@error_position_quad + self.kv_min*(1/2)*(self.mass)*error_velocity_quad.T@error_velocity_quad
 
         # Error cable direction
         error_n1 = ca.cross(n1_d, n1)
@@ -842,7 +893,7 @@ class PayloadControlMujocoNode(Node):
         t_now = time.time() - self.trajectory_start_time
         for j in range(self.N_prediction):
             tj = t_now + j * self.ts
-            pd, vd, ad, _, _ = self.desired_lissajous(tj)
+            pd, vd, ad, _, _ = self.desired_reference(tj)
 
             yref = np.zeros((self.n_x,), dtype=np.double)
             yref[0:3] = pd
@@ -860,7 +911,7 @@ class PayloadControlMujocoNode(Node):
             aux_ref = np.hstack((yref, uref))
             self.acados_ocp_solver.set(j, "p", aux_ref)
 
-        pdN, vdN, adN, _, _ = self.desired_lissajous(t_now + self.N_prediction * self.ts)
+        pdN, vdN, adN, _, _ = self.desired_reference(t_now + self.N_prediction * self.ts)
         yref_N = np.zeros((self.n_x,), dtype=np.double)
         yref_N[0:3] = pdN
         yref_N[3:6] = vdN
