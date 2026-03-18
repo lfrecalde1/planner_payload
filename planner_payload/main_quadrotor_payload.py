@@ -23,12 +23,12 @@ class PayloadControlMujocoNode(Node):
 
         # Runtime parameters (mirrors dq_nmpc style parameterization).
         self.declare_parameter('planner.ts', 0.05)
-        self.declare_parameter('planner.horizon_time', 1.0)
+        self.declare_parameter('planner.horizon_time', 2.0)
         self.declare_parameter('planner.trajectory_speed_scale', 1.0)
         self.declare_parameter('planner.transition_hold_time', 2.0)
         self.declare_parameter('planner.transition_blend_time', 3.5)
         self.declare_parameter('planner.acceleration_phase_time', 3.5)
-        self.declare_parameter('planner.cruise_speed_factor', 1.5)
+        self.declare_parameter('planner.cruise_speed_factor', 1.0)
         self.declare_parameter('planner.height_offset', 0.8)
         self.declare_parameter('planner.reference_mode', 'trajectory')
         self.declare_parameter('planner.regulation_offset', [1.0, 1.0, 0.5])
