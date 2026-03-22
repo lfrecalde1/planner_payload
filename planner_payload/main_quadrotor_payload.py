@@ -33,10 +33,10 @@ class PayloadControlMujocoNode(Node):
         self.declare_parameter('planner.reference_mode', 'trajectory')
         self.declare_parameter('planner.regulation_offset', [1.0, 1.0, 0.5])
         self.declare_parameter('nmpc.weight_cable_direction', 0.1)
-        self.declare_parameter('nmpc.weight_tension', 5.0)
-        self.declare_parameter('nmpc.weight_rdot', 5.0)
-        self.declare_parameter('nmpc.weight_orthogonality', 10.0)
-        self.declare_parameter('nmpc.norm_constraint_slack_weight', 100.0)
+        self.declare_parameter('nmpc.weight_tension', 50.0)
+        self.declare_parameter('nmpc.weight_rdot', 50.0)
+        self.declare_parameter('nmpc.weight_orthogonality', 1.0)
+        self.declare_parameter('nmpc.norm_constraint_slack_weight', 1.0)
         self.declare_parameter('nmpc.unit_vector_norm_tol', 1e-3)
         self.declare_parameter('nmpc.regularize_method', 'CONVEXIFY')
 
@@ -48,6 +48,7 @@ class PayloadControlMujocoNode(Node):
         self.t_N = float(self.get_parameter('planner.horizon_time').value)
         self.N = np.arange(0, self.t_N + self.ts, self.ts)
         self.N_prediction = self.N.shape[0]
+        print(self.N_prediction)
 
         # Internal parameters defintion
         self.robot_num = 1
@@ -121,7 +122,7 @@ class PayloadControlMujocoNode(Node):
 
 
         # Define PositionCmd publisher for each droe
-        self.publisher_ref_drone_0 = self.create_publisher(PositionCommand, "/quadrotor/position_cmd", 10)
+        self.publisher_ref_drone_0 = self.create_publisher(PositionCommand, "/quadrotor/payload_planner_quadrotor_cmd", 10)
         self.publisher_prediction_drone_0 = self.create_publisher(Path, "/quadrotor/predicted_path", 10)
         self.publisher_prediction_payload = self.create_publisher(Path, "/quadrotor/payload/predicted_path", 10)
         self.publisher_desired_quadrotor = self.create_publisher(Path, "/quadrotor/desired_path", 10)
@@ -462,7 +463,7 @@ class PayloadControlMujocoNode(Node):
 
     def payloadModel(self)->AcadosModel:
         # Model Name
-        model_name = "simple_payload"
+        model_name = "payload_planner"
 
         #position 
         p_x = ca.MX.sym('p_x')
@@ -540,7 +541,6 @@ class PayloadControlMujocoNode(Node):
         ny = nx + nu
 
         # Set Dimension of the problem
-        ocp.p = model.p
         ocp.dims.N = self.N_prediction
 
         # Definition of the cost functions (EXTERNAL)
@@ -741,7 +741,7 @@ class PayloadControlMujocoNode(Node):
         r_velocity_f = ca.Function('r_velocity_f', [x, xQ], [r_k])
         return r_velocity_f
 
-    def send_position_cmd(self, publisher, x, v, a, tension, direction):
+    def send_position_cmd(self, publisher, x, v, a, tension, direction, r_dot):
         position_cmd_msg = PositionCommand()
         position_cmd_msg.position.x = x[0]
         position_cmd_msg.position.y = x[1]
@@ -761,6 +761,10 @@ class PayloadControlMujocoNode(Node):
         position_cmd_msg.cable_force.y = cable_force[1]
         position_cmd_msg.cable_force.z = cable_force[2]
 
+        position_cmd_msg.tension = tension
+        position_cmd_msg.cable_r_dot.x = r_dot[0]
+        position_cmd_msg.cable_r_dot.y = r_dot[1]
+        position_cmd_msg.cable_r_dot.z = r_dot[2]
 
         publisher.publish(position_cmd_msg)
         return None 
@@ -906,6 +910,7 @@ class PayloadControlMujocoNode(Node):
             uref = np.zeros((self.n_u,), dtype=np.double)
             tension_ff = -self.mass * np.dot(ad + np.array([0.0, 0.0, self.gravity]), np.array([0.0, 0.0, -1.0]))
             uref[0] = float(np.clip(tension_ff, self.tension_min, self.tension_max))
+            print(uref)
             uref[1:4] = 0.0
 
             aux_ref = np.hstack((yref, uref))
@@ -940,7 +945,7 @@ class PayloadControlMujocoNode(Node):
         xQ_dot = np.array(self.quadrotor_velocity(x_k)).reshape((3,))
         xQ_dot_dot = np.array(self.quadrotor_acceleration(x_k, u)).reshape((3,))
 
-        self.send_position_cmd(self.publisher_ref_drone_0, xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
+        self.send_position_cmd(self.publisher_ref_drone_0, xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9], u[1:4])
         self.get_logger().info("Solving the MPC problem")
         # Build Optimization Problem just once
         self.publish_transforms()
@@ -980,7 +985,7 @@ class PayloadControlMujocoNode(Node):
         xQ_dot = np.array(self.quadrotor_velocity(x_k)).reshape((self.robot_num*3, ))
         xQ_dot_dot = np.array(self.quadrotor_acceleration(x_k, u)).reshape((self.robot_num*3, ))
 
-        self.send_position_cmd(self.publisher_ref_drone_0, xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9])
+        self.send_position_cmd(self.publisher_ref_drone_0, xQ[0:3], xQ_dot[0:3], xQ_dot_dot[0:3], u[0], x_k[6:9], u[1:4])
         self.get_logger().info("Solving the MPC problem")
 
         # Build Optimization Problem just once
