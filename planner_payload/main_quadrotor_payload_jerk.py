@@ -17,9 +17,9 @@ from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker
 
 
-class PayloadControlMujocoNode(Node):
+class PayloadControlMujocoJerkNode(Node):
     def __init__(self):
-        super().__init__('SinglePayloadPlanner')
+        super().__init__('SinglePayloadPlannerJerk')
 
         # Runtime parameters (mirrors dq_nmpc style parameterization).
         self.declare_parameter('planner.ts', 0.05)
@@ -35,11 +35,14 @@ class PayloadControlMujocoNode(Node):
         self.declare_parameter('nmpc.weight_cable_direction', 0.1)
         self.declare_parameter('nmpc.weight_tension', 10.0)
         self.declare_parameter('nmpc.weight_accel', 20.0)
+        self.declare_parameter('nmpc.weight_jerk', 5.0)
         self.declare_parameter('nmpc.weight_cable_angular_velocity', 5.0)
         self.declare_parameter('nmpc.weight_orthogonality', 1.0)
         self.declare_parameter('nmpc.norm_constraint_slack_weight', 1.0)
         self.declare_parameter('nmpc.unit_vector_norm_tol', 1e-3)
         self.declare_parameter('nmpc.regularize_method', 'CONVEXIFY')
+        self.declare_parameter('nmpc.jerk_limit', [60.0, 60.0, 60.0])
+        self.declare_parameter('nmpc.tension_min', 0.1)
 
         # Time Definition
         self.ts = float(self.get_parameter('planner.ts').value)
@@ -97,16 +100,17 @@ class PayloadControlMujocoNode(Node):
         self.r_init = np.array([0.0, 0.0, 0.0]*self.robot_num, dtype=np.double)
 
         # Init states for the optimizer
-        self.x_0 = np.hstack((pos_0, vel_0, self.n_init, self.r_init))
+        self.aq_init = np.array([0.0, 0.0, 0.0], dtype=np.double)
+        self.measured_payload_state = np.hstack((pos_0, vel_0, self.n_init, self.r_init))
+        self.x_0 = np.hstack((self.measured_payload_state, self.aq_init))
 
-        # Init virtual control input: quadrotor acceleration a_Q.
+        # Jerk input and acceleration-state initialization.
         self.u_equilibrium = np.array([0.0, 0.0, 0.0], dtype=np.double)
 
-        # Bounds for virtual input a_Q [m/s^2].
-        self.aq_max = np.array([21.0, 21.0, 21.0], dtype=np.double)
-        self.aq_min = -self.aq_max
-        self.u_min = self.aq_min.copy()
-        self.u_max = self.aq_max.copy()
+        # Bounds for jerk input [m/s^3].
+        self.jerk_limit = np.array(self.get_parameter('nmpc.jerk_limit').value, dtype=np.double).reshape((3,))
+        self.u_min = -self.jerk_limit.copy()
+        self.u_max = self.jerk_limit.copy()
 
         # Define state dimension and control action
         self.n_x = self.x_0.shape[0]
@@ -166,8 +170,11 @@ class PayloadControlMujocoNode(Node):
         self.xd[9] = 0.0
         self.xd[10] = 0.0
         self.xd[11] = 0.0
+        self.xd[12] = 0.0
+        self.xd[13] = 0.0
+        self.xd[14] = 0.0
 
-        # Desired virtual input a_Q.
+        # Desired jerk input.
         self.ud[:] = 0.0
 
         # Flag
@@ -191,11 +198,15 @@ class PayloadControlMujocoNode(Node):
         self.weight_cable_direction = float(self.get_parameter('nmpc.weight_cable_direction').value)
         self.weight_tension = float(self.get_parameter('nmpc.weight_tension').value)
         self.weight_accel = float(self.get_parameter('nmpc.weight_accel').value)
+        self.weight_jerk = float(self.get_parameter('nmpc.weight_jerk').value)
         self.weight_cable_angular_velocity = float(self.get_parameter('nmpc.weight_cable_angular_velocity').value)
         self.weight_orthogonality = float(self.get_parameter('nmpc.weight_orthogonality').value)
         self.norm_constraint_slack_weight = float(self.get_parameter('nmpc.norm_constraint_slack_weight').value)
         self.unit_vector_norm_tol = float(self.get_parameter('nmpc.unit_vector_norm_tol').value)
         self.regularize_method = str(self.get_parameter('nmpc.regularize_method').value)
+        self.tension_min = float(self.get_parameter('nmpc.tension_min').value)
+        self.predicted_states = np.tile(self.x_0, (self.N_prediction + 1, 1))
+        self.predicted_controls = np.tile(self.ud, (self.N_prediction, 1))
 
     def _base_lissajous(self, t: float):
         xc, yc, zc = self.payload_ref_start[0], self.payload_ref_start[1], self.payload_ref_start[2] + self.height_offset
@@ -403,7 +414,8 @@ class PayloadControlMujocoNode(Node):
         r = np.array(self.cable_angular_velocity_from_measurements(payload_states, x_quadrotor)).reshape((self.robot_num*3, ))
 
         payload_states_full = np.hstack((x, unit, r))
-        self.x_0 = payload_states_full
+        self.measured_payload_state = payload_states_full
+        self.x_0 = np.hstack((payload_states_full, self.get_predicted_acceleration_state()))
         self.payload_odom_received = True
         self.try_initialize_reference()
 
@@ -455,9 +467,37 @@ class PayloadControlMujocoNode(Node):
             target_str = np.array2string(target, precision=3, separator=", ", suppress_small=True)
             self.get_logger().info(f"Regulation target (initial + offset): {target_str}")
 
+    def get_predicted_acceleration_state(self):
+        if self.predicted_states.shape[0] > 0:
+            return self.predicted_states[0, 12:15].copy()
+        return np.zeros((3,), dtype=np.double)
+
+    def refresh_current_state(self):
+        self.x_0 = np.hstack((self.measured_payload_state, self.get_predicted_acceleration_state()))
+
+    def warm_start_solver_from_prediction(self):
+        self.refresh_current_state()
+        self.predicted_states[0, :] = self.x_0
+        for stage in range(self.N_prediction + 1):
+            self.acados_ocp_solver.set(stage, "x", self.predicted_states[stage, :])
+        for stage in range(self.N_prediction):
+            self.acados_ocp_solver.set(stage, "u", self.predicted_controls[stage, :])
+
+    def store_prediction_for_warm_start(self):
+        next_states = np.zeros_like(self.predicted_states)
+        next_controls = np.zeros_like(self.predicted_controls)
+        for stage in range(self.N_prediction):
+            next_states[stage, :] = self.acados_ocp_solver.get(stage + 1, "x")
+        for stage in range(self.N_prediction - 1):
+            next_controls[stage, :] = self.acados_ocp_solver.get(stage + 1, "u")
+        next_states[self.N_prediction, :] = self.acados_ocp_solver.get(self.N_prediction, "x")
+        next_controls[self.N_prediction - 1, :] = self.acados_ocp_solver.get(self.N_prediction - 1, "u")
+        self.predicted_states = next_states
+        self.predicted_controls = next_controls
+
     def payloadModel(self)->AcadosModel:
         # Model Name
-        model_name = "payload_planner"
+        model_name = "payload_planner_jerk"
 
         #position 
         p_x = ca.MX.sym('p_x')
@@ -483,22 +523,26 @@ class PayloadControlMujocoNode(Node):
         rz_1 = ca.MX.sym('rz_1')
         r1 = ca.vertcat(rx_1, ry_1, rz_1)
         
+        ax_q = ca.MX.sym("ax_q")
+        ay_q = ca.MX.sym("ay_q")
+        az_q = ca.MX.sym("az_q")
+        a_q = ca.vertcat(ax_q, ay_q, az_q)
+
         # Full states of the system
-        x = ca.vertcat(x_p, v_p, n1, r1)
-        
-        # Virtual control action: quadrotor acceleration a_Q in inertial frame.
-        ax_q_cmd = ca.MX.sym("ax_q_cmd")
-        ay_q_cmd = ca.MX.sym("ay_q_cmd")
-        az_q_cmd = ca.MX.sym("az_q_cmd")
-        a_q_cmd = ca.vertcat(ax_q_cmd, ay_q_cmd, az_q_cmd)
-        u = a_q_cmd
+        x = ca.vertcat(x_p, v_p, n1, r1, a_q)
+
+        jx_q_cmd = ca.MX.sym("jx_q_cmd")
+        jy_q_cmd = ca.MX.sym("jy_q_cmd")
+        jz_q_cmd = ca.MX.sym("jz_q_cmd")
+        j_q_cmd = ca.vertcat(jx_q_cmd, jy_q_cmd, jz_q_cmd)
+        u = j_q_cmd
 
         # Linear Dynamics
         linear_velocity = v_p
         gravity_vec = self.gravity * self.e3
         linear_acceleration = (
             -gravity_vec
-            + n1 * ca.dot(n1, (a_q_cmd + gravity_vec))
+            + n1 * ca.dot(n1, (a_q + gravity_vec))
             - self.length * ca.dot(r1, r1) * n1
         )
 
@@ -506,10 +550,10 @@ class PayloadControlMujocoNode(Node):
         # Cable Kinematics
         n1_dot = ca.cross(r1, n1)
 
-        r1_dot = -(1.0 / self.length) * ca.cross(n1, (a_q_cmd + gravity_vec))
+        r1_dot = -(1.0 / self.length) * ca.cross(n1, (a_q + gravity_vec))
 
         # Explicit Dynamics
-        f_expl = ca.vertcat(linear_velocity, linear_acceleration, n1_dot, r1_dot)
+        f_expl = ca.vertcat(linear_velocity, linear_acceleration, n1_dot, r1_dot, j_q_cmd)
         p = ca.MX.sym('p', x.shape[0] + u.shape[0], 1)
 
         # Dynamics
@@ -553,7 +597,8 @@ class PayloadControlMujocoNode(Node):
         r1 = x[9:12]
 
         # Split control actions
-        a_q_cmd = u[0:3]
+        a_q = x[12:15]
+        j_q_cmd = u[0:3]
 
         # Get desired states of the system
         x_p_d = p[0:3]
@@ -563,6 +608,7 @@ class PayloadControlMujocoNode(Node):
         
         # Desired virtual control actions.
         a_q_d = p[12:15]
+        j_q_d = p[15:18]
         
         # Error of linear dynamics
         error_position_quad = x_p - x_p_d
@@ -577,16 +623,22 @@ class PayloadControlMujocoNode(Node):
         r_error = r1 - (I - n1 @ n1.T) @ r1_d
 
         # Cost Function control actions
-        a_q_error = a_q_d - a_q_cmd
+        a_q_error = a_q_d - a_q
+        j_q_error = j_q_d - j_q_cmd
         
         # Enforce the velocity is orthogonal
         orthogonality_error = ca.dot(n1, r1)
+        tension_expr = self.mass * (
+            self.length * ca.dot(r1, r1)
+            - ca.dot(n1, (a_q + self.gravity * self.e3))
+        )
 
         ocp.model.cost_expr_ext_cost = (
             lyapunov_position
             + self.weight_cable_direction * (error_n1.T @ error_n1)
             + self.weight_cable_angular_velocity * (r_error.T @ r_error)
             + self.weight_accel * (a_q_error.T @ a_q_error)
+            + self.weight_jerk * (j_q_error.T @ j_q_error)
             + self.weight_orthogonality * (orthogonality_error**2)
         )
         ocp.model.cost_expr_ext_cost_e = (
@@ -609,8 +661,11 @@ class PayloadControlMujocoNode(Node):
         ocp.constraints.x0 = x0
 
         # Softly enforce ||n1|| ~= 1 to improve robustness against numerical drift.
-        ocp.model.con_h_expr = ca.vertcat(ca.dot(n1, n1))
-        nh = 1
+        ocp.model.con_h_expr = ca.vertcat(
+            ca.dot(n1, n1),
+            tension_expr,
+        )
+        nh = 2
         nsbx = 0
         nsh = nh
         ns = nsh + nsbx
@@ -618,8 +673,14 @@ class PayloadControlMujocoNode(Node):
         ocp.cost.Zl = self.norm_constraint_slack_weight * np.ones((ns, ))
         ocp.cost.zu = self.norm_constraint_slack_weight * np.ones((ns, ))
         ocp.cost.Zu = self.norm_constraint_slack_weight * np.ones((ns, ))
-        ocp.constraints.lh = np.array([1.0 - self.unit_vector_norm_tol])
-        ocp.constraints.uh = np.array([1.0 + self.unit_vector_norm_tol])
+        ocp.constraints.lh = np.array([
+            1.0 - self.unit_vector_norm_tol,
+            self.tension_min,
+        ])
+        ocp.constraints.uh = np.array([
+            1.0 + self.unit_vector_norm_tol,
+            10.0,
+        ])
         ocp.constraints.lsh = np.zeros((nsh, ))
         ocp.constraints.ush = np.zeros((nsh, ))
         ocp.constraints.idxsh = np.array(range(nsh), dtype=np.int32)
@@ -682,7 +743,7 @@ class PayloadControlMujocoNode(Node):
         # state & input
         x = ca.MX.sym('x', self.n_x, 1)
         u = ca.MX.sym('u', self.n_u, 1) 
-        quad_acc_f = ca.Function('quad_acc_f', [x, u], [u[0:3]])
+        quad_acc_f = ca.Function('quad_acc_f', [x, u], [x[12:15]])
         return quad_acc_f
 
     def cable_angular_velocity_c(self):
@@ -843,11 +904,7 @@ class PayloadControlMujocoNode(Node):
             ### Reset Solver
             self.acados_ocp_solver.reset()
 
-            ### Initial Conditions optimization problem
-            for stage in range(self.N_prediction + 1):
-                self.acados_ocp_solver.set(stage, "x", self.x_0)
-            for stage in range(self.N_prediction):
-                self.acados_ocp_solver.set(stage, "u", self.ud)
+            self.warm_start_solver_from_prediction()
             # Start trajectory clock only when the solver is ready.
             self.trajectory_start_time = time.time()
             self.start_time = self.trajectory_start_time
@@ -860,6 +917,7 @@ class PayloadControlMujocoNode(Node):
         if self.flag == 0:
             return
 
+        self.warm_start_solver_from_prediction()
         self.acados_ocp_solver.set(0, "lbx", self.x_0)
         self.acados_ocp_solver.set(0, "ubx", self.x_0)
 
@@ -868,7 +926,7 @@ class PayloadControlMujocoNode(Node):
         t_now = time.time() - self.trajectory_start_time
         for j in range(self.N_prediction):
             tj = t_now + j * self.ts
-            pd, vd, ad, _, _ = self.desired_reference(tj)
+            pd, vd, ad, jd, _ = self.desired_reference(tj)
 
             yref = np.zeros((self.n_x,), dtype=np.double)
             yref[0:3] = pd
@@ -877,21 +935,23 @@ class PayloadControlMujocoNode(Node):
             # keep cable reference simple for now
             yref[6:9] = np.array([0.0, 0.0, -1.0], dtype=np.double)
             yref[9:12] = np.zeros(3, dtype=np.double)
+            yref[12:15] = ad
 
-            uref = np.array(ad, dtype=np.double)
+            uref = np.array(jd, dtype=np.double)
             uref = np.clip(uref, self.u_min, self.u_max)
 
             aux_ref = np.hstack((yref, uref))
             self.acados_ocp_solver.set(j, "p", aux_ref)
 
-        pdN, vdN, adN, _, _ = self.desired_reference(t_now + self.N_prediction * self.ts)
+        pdN, vdN, adN, jdN, _ = self.desired_reference(t_now + self.N_prediction * self.ts)
         yref_N = np.zeros((self.n_x,), dtype=np.double)
         yref_N[0:3] = pdN
         yref_N[3:6] = vdN
         yref_N[6:9] = np.array([0.0, 0.0, -1.0], dtype=np.double)
         yref_N[9:12] = np.zeros(3, dtype=np.double)
+        yref_N[12:15] = adN
 
-        uref_N = np.array(adN, dtype=np.double)
+        uref_N = np.array(jdN, dtype=np.double)
         uref_N = np.clip(uref_N, self.u_min, self.u_max)
         aux_ref_N = np.hstack((yref_N, uref_N))
         self.acados_ocp_solver.set(self.N_prediction, "p", aux_ref_N)
@@ -901,6 +961,8 @@ class PayloadControlMujocoNode(Node):
             self.get_logger().error(f"acados returned status {status}")
             self.publish_transforms()
             return
+
+        self.store_prediction_for_warm_start()
 
         self.publish_desired_path()
         u = self.acados_ocp_solver.get(0, "u")
@@ -916,7 +978,7 @@ class PayloadControlMujocoNode(Node):
         omega = x_k[9:12]
         tension = self.mass * (
             self.length * float(np.dot(omega, omega))
-            - float(np.dot(n_vec, (u[0:3] + np.array([0.0, 0.0, self.gravity], dtype=np.double))))
+            - float(np.dot(n_vec, (x_k[12:15] + np.array([0.0, 0.0, self.gravity], dtype=np.double))))
         )
         self.send_position_cmd(
             self.publisher_ref_drone_0,
@@ -970,7 +1032,7 @@ class PayloadControlMujocoNode(Node):
         omega = x_k[9:12]
         tension = self.mass * (
             self.length * float(np.dot(omega, omega))
-            - float(np.dot(n_vec, (u[0:3] + np.array([0.0, 0.0, self.gravity], dtype=np.double))))
+            - float(np.dot(n_vec, (x_k[12:15] + np.array([0.0, 0.0, self.gravity], dtype=np.double))))
         )
         self.send_position_cmd(
             self.publisher_ref_drone_0,
@@ -990,7 +1052,7 @@ class PayloadControlMujocoNode(Node):
 
 def main(arg = None):
     rclpy.init(args=arg)
-    payload_node = PayloadControlMujocoNode()
+    payload_node = PayloadControlMujocoJerkNode()
     try:
         rclpy.spin(payload_node)  # Will run until manually interrupted
     except KeyboardInterrupt:
