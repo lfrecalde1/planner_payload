@@ -29,6 +29,7 @@ setup(
             'quadrotorpolicy = planner_payload.main_quadrotor:main',
             'single_new = planner_payload.main_quadrotor_payload_new:main',
             'single_jerk = planner_payload.main_quadrotor_payload_jerk:main',
+            'inner_ipm_pendulum = planner_payload.inner_ipm_pendulum_node:main',
         ],
     },
 )
