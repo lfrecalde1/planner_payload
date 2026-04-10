@@ -30,6 +30,7 @@ setup(
             'single_new = planner_payload.main_quadrotor_payload_new:main',
             'single_jerk = planner_payload.main_quadrotor_payload_jerk:main',
             'inner_ipm_pendulum = planner_payload.inner_ipm_pendulum_node:main',
+            'quadrotor_cable_dynamics = planner_payload.casadi_cable_dynamics_node:main',
         ],
     },
 )

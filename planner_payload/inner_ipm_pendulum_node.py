@@ -31,15 +31,15 @@ Vec = np.ndarray
 
 @dataclass
 class Params:
-    m1: float = 2.0
-    m2: float = 1.5
+    m1: float = 1.0
+    m2: float = 0.2
     g: float = 9.81
     cable_length: float = 1.0
-    dt: float = 0.01
-    inner_iters: int = 10
-    mu: float = 0.01
-    damping1: float = 0.3
-    damping2: float = 0.3
+    dt: float = 0.03
+    inner_iters: int = 150
+    mu: float = 0.001
+    damping1: float = 0.1
+    damping2: float = 0.1
 
 
 @dataclass
