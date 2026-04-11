@@ -31,6 +31,8 @@ setup(
             'single_jerk = planner_payload.main_quadrotor_payload_jerk:main',
             'inner_ipm_pendulum = planner_payload.inner_ipm_pendulum_node:main',
             'quadrotor_cable_dynamics = planner_payload.casadi_cable_dynamics_node:main',
+            'quadrotor_cable_hybrid_nmpc = planner_payload.controller_based_on_inverse_dynamcis:main',
+            'quadrotor_cable_implicit_nmpc = planner_payload.controller_based_on_implicit_theorem:main',
         ],
     },
 )

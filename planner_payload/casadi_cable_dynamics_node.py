@@ -88,7 +88,7 @@ def geometry_terms(x1: Vec, x2: Vec, v_next: Vec, params: Params) -> tuple[float
 
 def fixed_carrier_controller(state: State, params: Params) -> Vec:
     """Controller that keeps the carrier close to the desired point."""
-    kp = np.diag([260.0, 260.0, 400.0])
+    kp = np.diag([60.0, 60.0, 100.0])
     kd = np.diag([18.0, 18.0, 20.0])
     gravity_offset = np.array([0.0, 0.0, -params.m2 * params.g], dtype=float)
     return gravity_offset + kp @ (CARRIER_DESIRED - state.x1) - kd @ state.v1
