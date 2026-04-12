@@ -29,19 +29,19 @@ class Params:
     dt: float = 0.03
     mu: float = 1.0e-3
     damping1: float = 0.1
-    damping2: float = 0.1
+    damping2: float = 0.05
 
     inner_iters: int = 80
     residual_tol: float = 1.0e-9
     linear_reg: float = 1.0e-10
 
     # Collision-avoidance distance
-    min_distance: float = 0.4
+    min_distance: float = 0.6
 
 
 @dataclass
 class MPCConfig:
-    N: int = 30
+    N: int = 40
     u_min: tuple[float, float, float] = (-20.0, -20.0, -20.0)
     u_max: tuple[float, float, float] = (20.0, 20.0, 20.0)
     ipopt_max_iter: int = 120
@@ -79,7 +79,7 @@ class State:
         )
 
 
-PAYLOAD_TARGET = np.array([2.2, 1.5, 2.2], dtype=float)
+PAYLOAD_TARGET = np.array([1.5, 0.0, 1.5], dtype=float)
 INITIAL_CARRIER = np.array([0.0, 0.0, 0.0], dtype=float)
 INITIAL_PAYLOAD = np.array([0.0, 0.0, -0.99], dtype=float)
 

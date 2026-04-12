@@ -48,7 +48,7 @@ class Params:
     inner_iters: int = 150
     mu: float = 0.001
     damping1: float = 0.1
-    damping2: float = 0.1
+    damping2: float = 0.05
 
     # Numerical settings
     linear_reg: float = 1.0e-10
