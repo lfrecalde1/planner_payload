@@ -83,7 +83,7 @@ class State:
         )
 
 
-PAYLOAD_TARGET = np.array([1.2, 0.5, 1.2], dtype=float)
+PAYLOAD_TARGET = np.array([1.5, 0.0, 1.5], dtype=float)
 INITIAL_CARRIER = np.array([0.0, 0.0, 0.0], dtype=float)
 INITIAL_PAYLOAD = np.array([0.0, 0.0, -1.0], dtype=float)
 
@@ -328,38 +328,57 @@ class ILQRCost:
         self.W = weights
         self.payload_target = np.asarray(payload_target).reshape(3)
         self.min_distance = float(min_distance)
+        self._build_symbolics()
 
-    def stage_cost(self, x: np.ndarray, u: np.ndarray) -> float:
-        x = np.asarray(x).reshape(12)
-        u = np.asarray(u).reshape(3)
+    def _build_symbolics(self) -> None:
+        x = ca.MX.sym("x", 12)
+        u = ca.MX.sym("u", 3)
 
         x1 = x[0:3]
         x2 = x[3:6]
         v1 = x[6:9]
         v2 = x[9:12]
+        ep = x2 - ca.DM(self.payload_target)
 
-        ep = x2 - self.payload_target
+        stage = (
+            ca.mtimes([ep.T, ca.DM(self.W.Q_payload), ep])
+            + ca.mtimes([v1.T, ca.DM(self.W.Q_carrier_vel), v1])
+            + ca.mtimes([v2.T, ca.DM(self.W.Q_payload_vel), v2])
+            + ca.mtimes([u.T, ca.DM(self.W.R_u), u])
+        )
 
-        J = 0.0
-        J += float(ep.T @ self.W.Q_payload @ ep)
-        J += float(v1.T @ self.W.Q_carrier_vel @ v1)
-        J += float(v2.T @ self.W.Q_payload_vel @ v2)
-        J += float(u.T @ self.W.R_u @ u)
+        terminal = ca.mtimes([ep.T, ca.DM(self.W.Qf_payload), ep])
 
-        # Smooth collision barrier
-        dist = np.linalg.norm(x2 - x1)
-        h = dist - self.min_distance
-        if h <= 0.0:
-            J += self.W.w_collision * 1.0e6
-        else:
-            J += self.W.w_collision / (h + self.W.collision_eps)
+        lx = ca.gradient(stage, x)
+        lu = ca.gradient(stage, u)
+        lxx = ca.hessian(stage, x)[0]
+        luu = ca.hessian(stage, u)[0]
+        lux = ca.jacobian(lu, x)
 
-        return J
+        terminal_lx = ca.gradient(terminal, x)
+        terminal_lxx = ca.hessian(terminal, x)[0]
+
+        self.stage_cost_fun = ca.Function("stage_cost_fun", [x, u], [stage])
+        self.terminal_cost_fun = ca.Function("terminal_cost_fun", [x], [terminal])
+        self.stage_derivatives_fun = ca.Function(
+            "stage_derivatives_fun",
+            [x, u],
+            [lx, lu, lxx, luu, lux],
+        )
+        self.terminal_derivatives_fun = ca.Function(
+            "terminal_derivatives_fun",
+            [x],
+            [terminal_lx, terminal_lxx],
+        )
+
+    def stage_cost(self, x: np.ndarray, u: np.ndarray) -> float:
+        x = np.asarray(x).reshape(12)
+        u = np.asarray(u).reshape(3)
+        return float(np.array(self.stage_cost_fun(x, u)).reshape(()))
 
     def terminal_cost(self, x: np.ndarray) -> float:
         x = np.asarray(x).reshape(12)
-        ep = x[3:6] - self.payload_target
-        return float(ep.T @ self.W.Qf_payload @ ep)
+        return float(np.array(self.terminal_cost_fun(x)).reshape(()))
 
     def total_cost(self, X: list[np.ndarray], U: list[np.ndarray]) -> float:
         cost = 0.0
@@ -375,92 +394,24 @@ class ILQRCost:
         eps_x: float = 1.0e-5,
         eps_u: float = 1.0e-5,
     ):
-        nx = x.size
-        nu = u.size
-
-        lx = np.zeros(nx)
-        lu = np.zeros(nu)
-        lxx = np.zeros((nx, nx))
-        luu = np.zeros((nu, nu))
-        lux = np.zeros((nu, nx))
-
-        for i in range(nx):
-            dx = np.zeros(nx)
-            dx[i] = eps_x
-            fp = self.stage_cost(x + dx, u)
-            fm = self.stage_cost(x - dx, u)
-            lx[i] = (fp - fm) / (2.0 * eps_x)
-
-        for i in range(nu):
-            du = np.zeros(nu)
-            du[i] = eps_u
-            fp = self.stage_cost(x, u + du)
-            fm = self.stage_cost(x, u - du)
-            lu[i] = (fp - fm) / (2.0 * eps_u)
-
-        for i in range(nx):
-            for j in range(nx):
-                dxi = np.zeros(nx)
-                dxj = np.zeros(nx)
-                dxi[i] = eps_x
-                dxj[j] = eps_x
-                fpp = self.stage_cost(x + dxi + dxj, u)
-                fpm = self.stage_cost(x + dxi - dxj, u)
-                fmp = self.stage_cost(x - dxi + dxj, u)
-                fmm = self.stage_cost(x - dxi - dxj, u)
-                lxx[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps_x * eps_x)
-
-        for i in range(nu):
-            for j in range(nu):
-                dui = np.zeros(nu)
-                duj = np.zeros(nu)
-                dui[i] = eps_u
-                duj[j] = eps_u
-                fpp = self.stage_cost(x, u + dui + duj)
-                fpm = self.stage_cost(x, u + dui - duj)
-                fmp = self.stage_cost(x, u - dui + duj)
-                fmm = self.stage_cost(x, u - dui - duj)
-                luu[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps_u * eps_u)
-
-        for i in range(nu):
-            for j in range(nx):
-                du = np.zeros(nu)
-                dx = np.zeros(nx)
-                du[i] = eps_u
-                dx[j] = eps_x
-                fpp = self.stage_cost(x + dx, u + du)
-                fpm = self.stage_cost(x - dx, u + du)
-                fmp = self.stage_cost(x + dx, u - du)
-                fmm = self.stage_cost(x - dx, u - du)
-                lux[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps_u * eps_x)
-
-        return lx, lu, lxx, luu, lux
+        x = np.asarray(x).reshape(12)
+        u = np.asarray(u).reshape(3)
+        lx, lu, lxx, luu, lux = self.stage_derivatives_fun(x, u)
+        return (
+            np.array(lx).astype(float).reshape(12),
+            np.array(lu).astype(float).reshape(3),
+            np.array(lxx).astype(float),
+            np.array(luu).astype(float),
+            np.array(lux).astype(float),
+        )
 
     def terminal_derivatives_fd(self, x: np.ndarray, eps_x: float = 1.0e-5):
-        nx = x.size
-        lx = np.zeros(nx)
-        lxx = np.zeros((nx, nx))
-
-        for i in range(nx):
-            dx = np.zeros(nx)
-            dx[i] = eps_x
-            fp = self.terminal_cost(x + dx)
-            fm = self.terminal_cost(x - dx)
-            lx[i] = (fp - fm) / (2.0 * eps_x)
-
-        for i in range(nx):
-            for j in range(nx):
-                dxi = np.zeros(nx)
-                dxj = np.zeros(nx)
-                dxi[i] = eps_x
-                dxj[j] = eps_x
-                fpp = self.terminal_cost(x + dxi + dxj)
-                fpm = self.terminal_cost(x + dxi - dxj)
-                fmp = self.terminal_cost(x - dxi + dxj)
-                fmm = self.terminal_cost(x - dxi - dxj)
-                lxx[i, j] = (fpp - fpm - fmp + fmm) / (4.0 * eps_x * eps_x)
-
-        return lx, lxx
+        x = np.asarray(x).reshape(12)
+        lx, lxx = self.terminal_derivatives_fun(x)
+        return (
+            np.array(lx).astype(float).reshape(12),
+            np.array(lxx).astype(float),
+        )
 
 
 # ============================================================

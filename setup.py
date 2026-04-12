@@ -33,6 +33,6 @@ setup(
             'quadrotor_cable_dynamics = planner_payload.casadi_cable_dynamics_node:main',
             'quadrotor_cable_hybrid_nmpc = planner_payload.controller_based_on_inverse_dynamcis:main',
             'quadrotor_cable_implicit_nmpc = planner_payload.controller_based_on_implicit_theorem:main',
-        ],
+            'quadrotor_cable_acados = planner_payload.controller_acados:main', ],
     },
 )

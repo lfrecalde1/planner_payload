@@ -509,9 +509,9 @@ class PayloadNMPCNode(Node):
 
         self.weights = Weights(
             Q_payload=np.diag([40.0, 40.0, 80.0]),
-            Q_carrier_vel=np.diag([1.0, 1.0, 1.0]),
+            Q_carrier_vel=np.diag([2.0, 2.0, 2.0]),
             Q_payload_vel=np.diag([3.0, 3.0, 3.0]),
-            R_u=np.diag([1.0e-3, 1.0e-3, 1.0e-3]),
+            R_u=np.diag([5.0e-3, 5.0e-3, 5.0e-3]),
             Qf_payload=np.diag([120.0, 120.0, 180.0]),
         )
 
