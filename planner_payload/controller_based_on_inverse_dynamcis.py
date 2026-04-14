@@ -44,9 +44,9 @@ class MPCConfig:
     N: int = 40
     u_min: tuple[float, float, float] = (-20.0, -20.0, -20.0)
     u_max: tuple[float, float, float] = (20.0, 20.0, 20.0)
-    ipopt_max_iter: int = 120
-    ipopt_tol: float = 1.0e-5
-    ipopt_acceptable_tol: float = 1.0e-4
+    ipopt_max_iter: int = 20
+    ipopt_tol: float = 1.0e-1
+    ipopt_acceptable_tol: float = 1.0e-1
 
 
 @dataclass
